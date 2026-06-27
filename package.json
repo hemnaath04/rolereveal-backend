@@ -3,5 +3,5 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "OpenAI-compatible LLM proxy for the AI Jobby extension. Hides the real API key server-side."
+  "description": "OpenAI-compatible LLM proxy for the RoleReveal extension. Hides the real API key server-side."
 }

@@ -16,7 +16,7 @@ response (`choices[0].message.content`). CORS-enabled.
 
 ## Deploy (Vercel)
 ```bash
-cd ai-jobby-backend
+cd rolereveal-backend
 npx vercel        # first deploy (links/creates the project)
 npx vercel --prod # production
 ```
@@ -31,7 +31,7 @@ Recommended before going public:
 - `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` (per-IP rate limit)
 
 ## Point the extension at it
-In `ai-jobby/src/lib/config.ts`:
+In `rolereveal/src/lib/config.ts`:
 ```ts
 export const DEFAULT_BACKEND = {
   provider: 'custom',

@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// AI Jobby backend proxy (Vercel Edge Function).
+// RoleReveal backend proxy (Vercel Edge Function).
 //
 // Why this exists: a Chrome extension is public JS, so any key shipped in it is
 // extractable. This proxy holds the real LLM key SERVER-SIDE (env var) and the
@@ -98,7 +98,7 @@ async function checkLimits(clientId: string, ip: string): Promise<LimitVerdict> 
     return {
       ok: false,
       error: 'daily_limit_reached',
-      message: `Daily limit of ${perUser} scored jobs reached. Try again tomorrow, or add your own API key in AI Jobby → Options.`,
+      message: `Daily limit of ${perUser} scored jobs reached. Try again tomorrow, or add your own API key in RoleReveal → Options.`,
       retryAfter: secsToUtcMidnight(),
     };
 
