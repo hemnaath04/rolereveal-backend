@@ -11,6 +11,9 @@
 // ---------------------------------------------------------------------------
 export const config = { runtime: 'edge' };
 
+// Vercel provides process.env at runtime; declare it so we don't need @types/node.
+declare const process: { env: Record<string, string | undefined> };
+
 const CORS: Record<string, string> = {
   'access-control-allow-origin': '*',
   'access-control-allow-methods': 'POST, OPTIONS',
