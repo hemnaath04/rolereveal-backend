@@ -14,7 +14,7 @@ export const config = { runtime: 'edge' };
 const CORS: Record<string, string> = {
   'access-control-allow-origin': '*',
   'access-control-allow-methods': 'POST, OPTIONS',
-  'access-control-allow-headers': 'authorization, content-type, x-app-token',
+  'access-control-allow-headers': 'authorization, content-type, x-app-token, x-client-id',
   'access-control-max-age': '86400',
 };
 
@@ -30,28 +30,83 @@ function clampNum(v: unknown, min: number, max: number, dflt: number): number {
   return Math.min(max, Math.max(min, n));
 }
 
-// Per-IP rate limit. Only enforced when Upstash Redis env vars are set; without
-// them it fails open (deploy works immediately, add Upstash before going wide).
-async function withinRateLimit(ip: string): Promise<boolean> {
-  const url = process.env.UPSTASH_REDIS_REST_URL;
-  const tok = process.env.UPSTASH_REDIS_REST_TOKEN;
-  if (!url || !tok) return true;
-  const limit = Number(process.env.RATE_LIMIT_PER_MIN || '20');
-  const bucket = `aj:${ip}:${Math.floor(Date.now() / 60000)}`;
+// ── Strict, persistent rate limiting via Upstash Redis ──────────────────────
+// Counters survive across edge invocations. Enforced ONLY when Upstash env vars
+// are set — set them before going public, or there is no shared counter to
+// enforce against (serverless has no shared memory).
+function redisConfigured(): boolean {
+  return !!(process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN);
+}
+
+async function incrWithTtl(key: string, ttlSeconds: number): Promise<number | null> {
+  const url = process.env.UPSTASH_REDIS_REST_URL!;
+  const tok = process.env.UPSTASH_REDIS_REST_TOKEN!;
   try {
-    const r = await fetch(`${url}/incr/${bucket}`, {
+    const r = await fetch(`${url}/incr/${encodeURIComponent(key)}`, {
       headers: { authorization: `Bearer ${tok}` },
     });
     const count = Number((await r.json()).result);
     if (count === 1) {
-      await fetch(`${url}/expire/${bucket}/120`, {
+      await fetch(`${url}/expire/${encodeURIComponent(key)}/${ttlSeconds}`, {
         headers: { authorization: `Bearer ${tok}` },
       });
     }
-    return count <= limit;
+    return count;
   } catch {
-    return true; // never block on limiter failure
+    return null; // never hard-fail a request because the limiter glitched
   }
+}
+
+const dayStamp = () => new Date().toISOString().slice(0, 10).replace(/-/g, '');
+const secsToUtcMidnight = () => {
+  const now = new Date();
+  const next = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+  return Math.max(1, Math.floor((next.getTime() - now.getTime()) / 1000));
+};
+
+interface LimitVerdict {
+  ok: boolean;
+  error?: string;
+  message?: string;
+  retryAfter?: number;
+}
+
+async function checkLimits(clientId: string, ip: string): Promise<LimitVerdict> {
+  if (!redisConfigured()) return { ok: true }; // can't enforce without a store
+  const day = dayStamp();
+  const perUser = Number(process.env.DAILY_LIMIT_PER_USER || '100');
+  const perIpDay = Number(process.env.DAILY_LIMIT_PER_IP || '300');
+  const perMin = Number(process.env.RATE_LIMIT_PER_MIN || '20');
+  const globalDay = Number(process.env.GLOBAL_DAILY_CAP || '0'); // 0 = disabled
+
+  // 1) Burst per IP (per minute).
+  const burst = await incrWithTtl(`aj:min:${ip}:${Math.floor(Date.now() / 60000)}`, 120);
+  if (burst !== null && burst > perMin)
+    return { ok: false, error: 'rate_limited', message: 'Too many requests, slow down.', retryAfter: 60 };
+
+  // 2) Daily per IP (defeats client-id rotation).
+  const ipDay = await incrWithTtl(`aj:ipday:${ip}:${day}`, 90000);
+  if (ipDay !== null && ipDay > perIpDay)
+    return { ok: false, error: 'daily_ip_limit', message: 'Daily limit reached for this network.', retryAfter: secsToUtcMidnight() };
+
+  // 3) Daily per user (the 100/day cap).
+  const userDay = await incrWithTtl(`aj:uday:${clientId || ip}:${day}`, 90000);
+  if (userDay !== null && userDay > perUser)
+    return {
+      ok: false,
+      error: 'daily_limit_reached',
+      message: `Daily limit of ${perUser} scored jobs reached. Try again tomorrow, or add your own API key in AI Jobby → Options.`,
+      retryAfter: secsToUtcMidnight(),
+    };
+
+  // 4) Optional global backstop across all users.
+  if (globalDay > 0) {
+    const all = await incrWithTtl(`aj:gday:${day}`, 90000);
+    if (all !== null && all > globalDay)
+      return { ok: false, error: 'service_busy', message: 'Daily capacity reached. Please try again tomorrow.', retryAfter: secsToUtcMidnight() };
+  }
+
+  return { ok: true };
 }
 
 export default async function handler(req: Request): Promise<Response> {
@@ -100,8 +155,14 @@ export default async function handler(req: Request): Promise<Response> {
   }
 
   const ip = (req.headers.get('x-forwarded-for') || '').split(',')[0].trim() || 'anon';
-  if (!(await withinRateLimit(ip))) {
-    return json({ error: 'rate_limited' }, 429, { 'retry-after': '60' });
+  const clientId = (req.headers.get('x-client-id') || '').slice(0, 64);
+  const verdict = await checkLimits(clientId, ip);
+  if (!verdict.ok) {
+    return json(
+      { error: verdict.error, message: verdict.message },
+      429,
+      { 'retry-after': String(verdict.retryAfter ?? 60) },
+    );
   }
 
   const upstreamBody = {
