@@ -1,6 +1,6 @@
-# AI Jobby Backend
+# RoleReveal Backend
 
-A tiny OpenAI-compatible proxy so the **AI Jobby** extension never ships a real
+A tiny OpenAI-compatible proxy so the **RoleReveal** extension never ships a real
 API key. The extension calls this endpoint; this proxy adds the key (from a
 server env var), rate-limits, caps request size, and forwards to your LLM.
 

@@ -6,7 +6,7 @@ declare const process: { env: Record<string, string | undefined> };
 export default function handler(): Response {
   const body = {
     ok: true,
-    service: 'ai-jobby-backend',
+    service: 'rolereveal-backend',
     upstream_configured: !!(process.env.UPSTREAM_BASE_URL && process.env.UPSTREAM_API_KEY),
     ratelimit_configured: !!(
       process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN
