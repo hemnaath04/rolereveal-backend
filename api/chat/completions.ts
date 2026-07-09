@@ -200,14 +200,25 @@ export default async function handler(req: Request): Promise<Response> {
   // generates omits the `additionalProperties: false` Anthropic's structured-
   // output API requires — a bug in Manifest, not fixable from here: see
   // github.com/mnfst/manifest PR #2421, toAnthropicOutputConfig's json_object
-  // branch). Retry once without response_format so a real request still
-  // succeeds; the system prompt already requires JSON-only output and
-  // extractJson() tolerates the resulting plain-text-mode response.
-  if (
-    upstream.status === 400 &&
-    body.response_format &&
-    text.includes('additionalProperties')
-  ) {
+  // branch). Manifest's error response doesn't include that raw detail though
+  // (only its own dashboard shows it) — the actual signal available here is
+  // { code: 'fallback_exhausted', source: 'manifest', provider: 'anthropic' }.
+  // Retry once without response_format so a real request still succeeds; the
+  // system prompt already requires JSON-only output and extractJson()
+  // tolerates the resulting plain-text-mode response.
+  const looksLikeManifestAnthropicSchemaBug = (): boolean => {
+    if (upstream.status !== 400 || !body.response_format) return false;
+    try {
+      const err = JSON.parse(text)?.error;
+      if (err?.code !== 'fallback_exhausted' || err?.source !== 'manifest') return false;
+      const fallbacks = Array.isArray(err?.attempted_fallbacks) ? err.attempted_fallbacks : [];
+      return err?.provider === 'anthropic' || fallbacks.some((f: any) => f?.provider === 'anthropic');
+    } catch {
+      return false;
+    }
+  };
+
+  if (looksLikeManifestAnthropicSchemaBug()) {
     try {
       upstream = await call(baseBody);
       text = await upstream.text();
