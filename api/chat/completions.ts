@@ -7,11 +7,12 @@
 // extension's existing "custom" provider works unchanged — just point its base
 // URL at `https://<this-deployment>/api`.
 //
-// Model routing: tries Groq's free tier FIRST (fast, no cost), and falls back
-// to the configured upstream (the Manifest gateway) on any Groq failure —
-// error, non-2xx, free-tier rate limit, timeout, or empty response. Groq is
-// entirely optional: with no GROQ_API_KEY set, behavior is unchanged (upstream
-// only). Neither key ever leaves this server.
+// Model routing: tries OpenRouter's free-model router FIRST (model
+// "openrouter/free", no cost), and falls back to the configured upstream (the
+// Manifest gateway) on any failure — error, non-2xx, free-tier rate limit,
+// timeout, or empty response. OpenRouter is entirely optional: with no
+// OPENROUTER_API_KEY set, behavior is unchanged (upstream only). Neither key
+// ever leaves this server.
 //
 // Route: POST /api/chat/completions   (Vercel maps this file to that path)
 // ---------------------------------------------------------------------------
@@ -118,39 +119,43 @@ async function checkLimits(clientId: string, ip: string): Promise<LimitVerdict> 
   return { ok: true };
 }
 
-// ── Groq free-tier attempt (primary), Manifest/upstream is the fallback ─────
-// Server-held key only (GROQ_API_KEY) — never sent to or read from the
-// extension. Kept fast with a short internal timeout so a hung Groq call
-// fails over to the fallback quickly instead of stalling the whole request.
-const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+// ── OpenRouter free-model attempt (primary), Manifest/upstream is the fallback
+// Server-held key only (OPENROUTER_API_KEY) — never sent to or read from the
+// extension. Kept fast with a short internal timeout so a hung call fails
+// over to the fallback quickly instead of stalling the whole request.
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
-interface GroqAttempt {
+interface PrimaryAttempt {
   ok: boolean;
   text?: string; // raw OpenAI-shaped JSON body, passed straight through
 }
 
-async function tryGroq(
+async function tryOpenRouterOnce(
   body: Record<string, unknown>,
-): Promise<GroqAttempt> {
-  const key = process.env.GROQ_API_KEY;
-  if (!key) return { ok: false }; // not configured — skip silently, no error
-
-  const model = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
-  const timeoutMs = Number(process.env.GROQ_TIMEOUT_MS || '12000');
+  key: string,
+  model: string,
+  timeoutMs: number,
+): Promise<PrimaryAttempt & { rateLimited?: boolean }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
-
   try {
-    const res = await fetch(GROQ_URL, {
+    const res = await fetch(OPENROUTER_URL, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+      headers: {
+        'content-type': 'application/json',
+        authorization: `Bearer ${key}`,
+        // Recommended by OpenRouter (app attribution for their leaderboards);
+        // not required for the request to work.
+        'http-referer': 'https://rolereveal.app',
+        'x-title': 'RoleReveal',
+      },
       body: JSON.stringify({ ...body, model }),
       signal: controller.signal,
     });
     const text = await res.text();
     if (!res.ok) {
-      console.error(`groq ${res.status}: ${text.slice(0, 300)}`);
-      return { ok: false };
+      console.error(`openrouter ${res.status}: ${text.slice(0, 300)}`);
+      return { ok: false, rateLimited: res.status === 429 };
     }
     // Validate there's real content before trusting this leg (a malformed or
     // empty response should also fail over, not return junk to the client).
@@ -163,11 +168,32 @@ async function tryGroq(
     if (!content) return { ok: false };
     return { ok: true, text };
   } catch (e: any) {
-    console.error(`groq unreachable/timeout: ${String(e?.message || e)}`);
+    console.error(`openrouter unreachable/timeout: ${String(e?.message || e)}`);
     return { ok: false };
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * "openrouter/free" picks a free model AT RANDOM per request, so a 429 (a
+ * specific free model temporarily rate-limited upstream, common on shared
+ * free-tier inference) is usually resolved by one retry landing on a
+ * different model. Retries only on 429, once, so a real outage still fails
+ * over to the Manifest leg quickly rather than doubling every request's cost.
+ */
+async function tryOpenRouter(
+  body: Record<string, unknown>,
+): Promise<PrimaryAttempt> {
+  const key = process.env.OPENROUTER_API_KEY;
+  if (!key) return { ok: false }; // not configured — skip silently, no error
+
+  const model = process.env.OPENROUTER_MODEL || 'openrouter/free';
+  const timeoutMs = Number(process.env.OPENROUTER_TIMEOUT_MS || '12000');
+
+  const first = await tryOpenRouterOnce(body, key, model, timeoutMs);
+  if (first.ok || !first.rateLimited) return first;
+  return tryOpenRouterOnce(body, key, model, timeoutMs);
 }
 
 export default async function handler(req: Request): Promise<Response> {
@@ -226,8 +252,9 @@ export default async function handler(req: Request): Promise<Response> {
     );
   }
 
-  // Shared, already-clamped fields; `model` is overridden per leg (Groq uses
-  // its own fixed GROQ_MODEL, unrelated to the upstream model/allowlist above).
+  // Shared, already-clamped fields; `model` is overridden per leg (OpenRouter
+  // uses its own fixed OPENROUTER_MODEL, unrelated to the upstream model/
+  // allowlist above).
   const sharedBody = {
     messages,
     temperature: clampNum(body.temperature, 0, 2, 0.2),
@@ -235,18 +262,27 @@ export default async function handler(req: Request): Promise<Response> {
     ...(body.response_format ? { response_format: body.response_format } : {}),
   };
 
-  // 1) Try Groq's free tier first. No-op (falls through immediately) if
-  // GROQ_API_KEY isn't set, or on any error/rate-limit/timeout/empty response.
-  const groq = await tryGroq(sharedBody);
-  if (groq.ok && groq.text) {
-    return new Response(groq.text, {
+  // 1) Try OpenRouter's free-model router first. No-op (falls through
+  // immediately) if OPENROUTER_API_KEY isn't set, or on any error/rate-limit/
+  // timeout/empty response.
+  const primary = await tryOpenRouter(sharedBody);
+  if (primary.ok && primary.text) {
+    return new Response(primary.text, {
       status: 200,
-      headers: { 'content-type': 'application/json', ...CORS, 'x-rr-provider': 'groq' },
+      headers: { 'content-type': 'application/json', ...CORS, 'x-rr-provider': 'openrouter' },
     });
   }
 
   // 2) Fall back to the configured upstream (the Manifest gateway).
-  const upstreamBody = { ...sharedBody, model };
+  // response_format is intentionally dropped here: Manifest's Claude route
+  // currently 400s on it ("output_config.format.schema: For 'object' type,
+  // 'additionalProperties' must be explicitly set to false" — a bug in how
+  // Manifest auto-builds the JSON schema for Anthropic from response_format,
+  // not something fixable from this proxy). The system prompt already
+  // requires JSON-only output and extractJson() tolerates minor formatting,
+  // so plain-text-mode JSON still parses fine without it.
+  const { response_format: _unused, ...sharedBodyNoFormat } = sharedBody as Record<string, unknown>;
+  const upstreamBody = { ...sharedBodyNoFormat, model };
   let upstream: Response;
   try {
     upstream = await fetch(`${UPSTREAM.replace(/\/+$/, '')}/chat/completions`, {
