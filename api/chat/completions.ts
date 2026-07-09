@@ -168,27 +168,55 @@ export default async function handler(req: Request): Promise<Response> {
     );
   }
 
-  const upstreamBody = {
+  const baseBody = {
     model,
     messages,
     temperature: clampNum(body.temperature, 0, 2, 0.2),
     max_tokens: Math.min(clampNum(body.max_tokens, 1, 4096, 900), 1200),
+  };
+  const upstreamBody = {
+    ...baseBody,
     ...(body.response_format ? { response_format: body.response_format } : {}),
   };
 
-  let upstream: Response;
-  try {
-    upstream = await fetch(`${UPSTREAM.replace(/\/+$/, '')}/chat/completions`, {
+  const call = (b: Record<string, unknown>) =>
+    fetch(`${UPSTREAM.replace(/\/+$/, '')}/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
-      body: JSON.stringify(upstreamBody),
+      body: JSON.stringify(b),
     });
+
+  let upstream: Response;
+  let text: string;
+  try {
+    upstream = await call(upstreamBody);
+    text = await upstream.text();
   } catch (e: any) {
     return json({ error: 'upstream_unreachable', detail: String(e?.message || e) }, 502);
   }
 
+  // Manifest's Anthropic route currently 400s on a schema it auto-builds for
+  // plain `response_format: {type:"json_object"}` requests (the schema it
+  // generates omits the `additionalProperties: false` Anthropic's structured-
+  // output API requires — a bug in Manifest, not fixable from here: see
+  // github.com/mnfst/manifest PR #2421, toAnthropicOutputConfig's json_object
+  // branch). Retry once without response_format so a real request still
+  // succeeds; the system prompt already requires JSON-only output and
+  // extractJson() tolerates the resulting plain-text-mode response.
+  if (
+    upstream.status === 400 &&
+    body.response_format &&
+    text.includes('additionalProperties')
+  ) {
+    try {
+      upstream = await call(baseBody);
+      text = await upstream.text();
+    } catch (e: any) {
+      return json({ error: 'upstream_unreachable', detail: String(e?.message || e) }, 502);
+    }
+  }
+
   // Pass the OpenAI-shaped response straight through (extension reads choices[0]).
-  const text = await upstream.text();
   return new Response(text, {
     status: upstream.status,
     headers: { 'content-type': 'application/json', ...CORS },
