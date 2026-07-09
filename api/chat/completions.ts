@@ -7,6 +7,12 @@
 // extension's existing "custom" provider works unchanged — just point its base
 // URL at `https://<this-deployment>/api`.
 //
+// Model routing: tries Groq's free tier FIRST (fast, no cost), and falls back
+// to the configured upstream (the Manifest gateway) on any Groq failure —
+// error, non-2xx, free-tier rate limit, timeout, or empty response. Groq is
+// entirely optional: with no GROQ_API_KEY set, behavior is unchanged (upstream
+// only). Neither key ever leaves this server.
+//
 // Route: POST /api/chat/completions   (Vercel maps this file to that path)
 // ---------------------------------------------------------------------------
 export const config = { runtime: 'edge' };
@@ -112,6 +118,58 @@ async function checkLimits(clientId: string, ip: string): Promise<LimitVerdict> 
   return { ok: true };
 }
 
+// ── Groq free-tier attempt (primary), Manifest/upstream is the fallback ─────
+// Server-held key only (GROQ_API_KEY) — never sent to or read from the
+// extension. Kept fast with a short internal timeout so a hung Groq call
+// fails over to the fallback quickly instead of stalling the whole request.
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
+
+interface GroqAttempt {
+  ok: boolean;
+  text?: string; // raw OpenAI-shaped JSON body, passed straight through
+}
+
+async function tryGroq(
+  body: Record<string, unknown>,
+): Promise<GroqAttempt> {
+  const key = process.env.GROQ_API_KEY;
+  if (!key) return { ok: false }; // not configured — skip silently, no error
+
+  const model = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
+  const timeoutMs = Number(process.env.GROQ_TIMEOUT_MS || '12000');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(GROQ_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+      body: JSON.stringify({ ...body, model }),
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      console.error(`groq ${res.status}: ${text.slice(0, 300)}`);
+      return { ok: false };
+    }
+    // Validate there's real content before trusting this leg (a malformed or
+    // empty response should also fail over, not return junk to the client).
+    let content = '';
+    try {
+      content = JSON.parse(text)?.choices?.[0]?.message?.content ?? '';
+    } catch {
+      /* falls through to ok:false below */
+    }
+    if (!content) return { ok: false };
+    return { ok: true, text };
+  } catch (e: any) {
+    console.error(`groq unreachable/timeout: ${String(e?.message || e)}`);
+    return { ok: false };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export default async function handler(req: Request): Promise<Response> {
   if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
   if (req.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
@@ -168,14 +226,27 @@ export default async function handler(req: Request): Promise<Response> {
     );
   }
 
-  const upstreamBody = {
-    model,
+  // Shared, already-clamped fields; `model` is overridden per leg (Groq uses
+  // its own fixed GROQ_MODEL, unrelated to the upstream model/allowlist above).
+  const sharedBody = {
     messages,
     temperature: clampNum(body.temperature, 0, 2, 0.2),
     max_tokens: Math.min(clampNum(body.max_tokens, 1, 4096, 900), 1200),
     ...(body.response_format ? { response_format: body.response_format } : {}),
   };
 
+  // 1) Try Groq's free tier first. No-op (falls through immediately) if
+  // GROQ_API_KEY isn't set, or on any error/rate-limit/timeout/empty response.
+  const groq = await tryGroq(sharedBody);
+  if (groq.ok && groq.text) {
+    return new Response(groq.text, {
+      status: 200,
+      headers: { 'content-type': 'application/json', ...CORS, 'x-rr-provider': 'groq' },
+    });
+  }
+
+  // 2) Fall back to the configured upstream (the Manifest gateway).
+  const upstreamBody = { ...sharedBody, model };
   let upstream: Response;
   try {
     upstream = await fetch(`${UPSTREAM.replace(/\/+$/, '')}/chat/completions`, {
@@ -191,6 +262,6 @@ export default async function handler(req: Request): Promise<Response> {
   const text = await upstream.text();
   return new Response(text, {
     status: upstream.status,
-    headers: { 'content-type': 'application/json', ...CORS },
+    headers: { 'content-type': 'application/json', ...CORS, 'x-rr-provider': 'manifest' },
   });
 }
