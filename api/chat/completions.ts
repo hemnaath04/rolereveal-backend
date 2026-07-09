@@ -7,13 +7,6 @@
 // extension's existing "custom" provider works unchanged — just point its base
 // URL at `https://<this-deployment>/api`.
 //
-// Model routing: tries OpenRouter's free-model router FIRST (model
-// "openrouter/free", no cost), and falls back to the configured upstream (the
-// Manifest gateway) on any failure — error, non-2xx, free-tier rate limit,
-// timeout, or empty response. OpenRouter is entirely optional: with no
-// OPENROUTER_API_KEY set, behavior is unchanged (upstream only). Neither key
-// ever leaves this server.
-//
 // Route: POST /api/chat/completions   (Vercel maps this file to that path)
 // ---------------------------------------------------------------------------
 export const config = { runtime: 'edge' };
@@ -119,83 +112,6 @@ async function checkLimits(clientId: string, ip: string): Promise<LimitVerdict> 
   return { ok: true };
 }
 
-// ── OpenRouter free-model attempt (primary), Manifest/upstream is the fallback
-// Server-held key only (OPENROUTER_API_KEY) — never sent to or read from the
-// extension. Kept fast with a short internal timeout so a hung call fails
-// over to the fallback quickly instead of stalling the whole request.
-const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
-
-interface PrimaryAttempt {
-  ok: boolean;
-  text?: string; // raw OpenAI-shaped JSON body, passed straight through
-}
-
-async function tryOpenRouterOnce(
-  body: Record<string, unknown>,
-  key: string,
-  model: string,
-  timeoutMs: number,
-): Promise<PrimaryAttempt & { rateLimited?: boolean }> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(OPENROUTER_URL, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${key}`,
-        // Recommended by OpenRouter (app attribution for their leaderboards);
-        // not required for the request to work.
-        'http-referer': 'https://rolereveal.app',
-        'x-title': 'RoleReveal',
-      },
-      body: JSON.stringify({ ...body, model }),
-      signal: controller.signal,
-    });
-    const text = await res.text();
-    if (!res.ok) {
-      console.error(`openrouter ${res.status}: ${text.slice(0, 300)}`);
-      return { ok: false, rateLimited: res.status === 429 };
-    }
-    // Validate there's real content before trusting this leg (a malformed or
-    // empty response should also fail over, not return junk to the client).
-    let content = '';
-    try {
-      content = JSON.parse(text)?.choices?.[0]?.message?.content ?? '';
-    } catch {
-      /* falls through to ok:false below */
-    }
-    if (!content) return { ok: false };
-    return { ok: true, text };
-  } catch (e: any) {
-    console.error(`openrouter unreachable/timeout: ${String(e?.message || e)}`);
-    return { ok: false };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * "openrouter/free" picks a free model AT RANDOM per request, so a 429 (a
- * specific free model temporarily rate-limited upstream, common on shared
- * free-tier inference) is usually resolved by one retry landing on a
- * different model. Retries only on 429, once, so a real outage still fails
- * over to the Manifest leg quickly rather than doubling every request's cost.
- */
-async function tryOpenRouter(
-  body: Record<string, unknown>,
-): Promise<PrimaryAttempt> {
-  const key = process.env.OPENROUTER_API_KEY;
-  if (!key) return { ok: false }; // not configured — skip silently, no error
-
-  const model = process.env.OPENROUTER_MODEL || 'openrouter/free';
-  const timeoutMs = Number(process.env.OPENROUTER_TIMEOUT_MS || '12000');
-
-  const first = await tryOpenRouterOnce(body, key, model, timeoutMs);
-  if (first.ok || !first.rateLimited) return first;
-  return tryOpenRouterOnce(body, key, model, timeoutMs);
-}
-
 export default async function handler(req: Request): Promise<Response> {
   if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
   if (req.method !== 'POST') return json({ error: 'method_not_allowed' }, 405);
@@ -252,37 +168,14 @@ export default async function handler(req: Request): Promise<Response> {
     );
   }
 
-  // Shared, already-clamped fields; `model` is overridden per leg (OpenRouter
-  // uses its own fixed OPENROUTER_MODEL, unrelated to the upstream model/
-  // allowlist above).
-  const sharedBody = {
+  const upstreamBody = {
+    model,
     messages,
     temperature: clampNum(body.temperature, 0, 2, 0.2),
     max_tokens: Math.min(clampNum(body.max_tokens, 1, 4096, 900), 1200),
     ...(body.response_format ? { response_format: body.response_format } : {}),
   };
 
-  // 1) Try OpenRouter's free-model router first. No-op (falls through
-  // immediately) if OPENROUTER_API_KEY isn't set, or on any error/rate-limit/
-  // timeout/empty response.
-  const primary = await tryOpenRouter(sharedBody);
-  if (primary.ok && primary.text) {
-    return new Response(primary.text, {
-      status: 200,
-      headers: { 'content-type': 'application/json', ...CORS, 'x-rr-provider': 'openrouter' },
-    });
-  }
-
-  // 2) Fall back to the configured upstream (the Manifest gateway).
-  // response_format is intentionally dropped here: Manifest's Claude route
-  // currently 400s on it ("output_config.format.schema: For 'object' type,
-  // 'additionalProperties' must be explicitly set to false" — a bug in how
-  // Manifest auto-builds the JSON schema for Anthropic from response_format,
-  // not something fixable from this proxy). The system prompt already
-  // requires JSON-only output and extractJson() tolerates minor formatting,
-  // so plain-text-mode JSON still parses fine without it.
-  const { response_format: _unused, ...sharedBodyNoFormat } = sharedBody as Record<string, unknown>;
-  const upstreamBody = { ...sharedBodyNoFormat, model };
   let upstream: Response;
   try {
     upstream = await fetch(`${UPSTREAM.replace(/\/+$/, '')}/chat/completions`, {
@@ -298,6 +191,6 @@ export default async function handler(req: Request): Promise<Response> {
   const text = await upstream.text();
   return new Response(text, {
     status: upstream.status,
-    headers: { 'content-type': 'application/json', ...CORS, 'x-rr-provider': 'manifest' },
+    headers: { 'content-type': 'application/json', ...CORS },
   });
 }

@@ -5,13 +5,9 @@ API key. The extension calls this endpoint; this proxy adds the key (from a
 server env var), rate-limits, caps request size, and forwards to your LLM.
 
 ```
-                                             ┌─▶ Groq free tier (primary, optional)
-extension  ──POST /api/chat/completions──▶  this proxy  ──┤
-(no secret)                                 (Vercel Edge)  └─▶ upstream / Manifest gateway (fallback)
+extension  ──POST /api/chat/completions──▶  this proxy  ──+ secret key──▶  LLM upstream
+(no secret)                                 (Vercel Edge)                  (Gemini/OpenAI/gateway)
 ```
-If `GROQ_API_KEY` is set, every request tries Groq first (fast, free) and falls
-back to `UPSTREAM_BASE_URL` on any Groq error, rate limit, timeout, or empty
-response. With no `GROQ_API_KEY`, it goes straight to upstream as before.
 
 ## Endpoint
 `POST /api/chat/completions` — standard OpenAI chat-completions body
@@ -33,12 +29,6 @@ Recommended before going public:
 - `ALLOWED_MODELS=gemini-3.5-flash` (force cheap model)
 - `APP_TOKEN=<random>` (revocable gate; also set it as the extension's key)
 - `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN` (per-IP rate limit)
-
-Optional, to use Groq's free tier as the primary model (falls back to
-`UPSTREAM_BASE_URL` automatically on any failure):
-- `GROQ_API_KEY` — a free key from https://console.groq.com/keys
-- `GROQ_MODEL` — default `llama-3.3-70b-versatile`
-- `GROQ_TIMEOUT_MS` — default `12000`; how long to wait before failing over
 
 ## Point the extension at it
 In `rolereveal/src/lib/config.ts`:
