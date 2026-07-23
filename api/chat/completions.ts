@@ -33,6 +33,71 @@ function clampNum(v: unknown, min: number, max: number, dflt: number): number {
   return Math.min(max, Math.max(min, n));
 }
 
+// Manifest translates OpenAI's loose `{ type: 'json_object' }` shorthand to
+// Anthropic native structured output. Anthropic requires every object in that
+// schema to declare `additionalProperties: false`; an unconstrained
+// `{ type: 'object' }` is rejected before the model runs. RoleReveal has one
+// JSON-mode operation, so upgrade that shorthand to its real strict schema at
+// the proxy. This fixes existing extension installs immediately and remains
+// compatible when Manifest routes the same request to Gemini or OpenAI.
+const EVALUATION_RESPONSE_FORMAT = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'rolereveal_evaluation',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        perResume: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              label: { type: 'string' },
+              score: { type: 'number' },
+            },
+            required: ['label', 'score'],
+          },
+        },
+        bestResume: { type: 'string' },
+        overallScore: { type: 'number' },
+        verdict: { type: 'string', enum: ['Apply', 'Maybe', 'Skip'] },
+        summary: { type: 'string' },
+        dimensions: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            skills: { type: 'number' },
+            experience: { type: 'number' },
+            roleContext: { type: 'number' },
+          },
+          required: ['skills', 'experience', 'roleContext'],
+        },
+        whyMatch: { type: 'string' },
+        watchOuts: { type: 'string' },
+      },
+      required: [
+        'perResume',
+        'bestResume',
+        'overallScore',
+        'verdict',
+        'summary',
+        'dimensions',
+        'whyMatch',
+        'watchOuts',
+      ],
+    },
+  },
+} as const;
+
+export function normalizeResponseFormat(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value;
+  const type = (value as Record<string, unknown>).type;
+  return type === 'json_object' ? EVALUATION_RESPONSE_FORMAT : value;
+}
+
 // ── Strict, persistent rate limiting via Upstash Redis ──────────────────────
 // Counters survive across edge invocations. Enforced ONLY when Upstash env vars
 // are set — set them before going public, or there is no shared counter to
@@ -174,9 +239,10 @@ export default async function handler(req: Request): Promise<Response> {
     temperature: clampNum(body.temperature, 0, 2, 0.2),
     max_tokens: Math.min(clampNum(body.max_tokens, 1, 4096, 900), 1200),
   };
+  const responseFormat = normalizeResponseFormat(body.response_format);
   const upstreamBody = {
     ...baseBody,
-    ...(body.response_format ? { response_format: body.response_format } : {}),
+    ...(responseFormat ? { response_format: responseFormat } : {}),
   };
 
   const call = (b: Record<string, unknown>) =>
@@ -195,16 +261,9 @@ export default async function handler(req: Request): Promise<Response> {
     return json({ error: 'upstream_unreachable', detail: String(e?.message || e) }, 502);
   }
 
-  // Manifest's Anthropic route currently 400s on a schema it auto-builds for
-  // plain `response_format: {type:"json_object"}` requests (the schema it
-  // generates omits the `additionalProperties: false` Anthropic's structured-
-  // output API requires — a bug in Manifest, not fixable from here: see
-  // github.com/mnfst/manifest PR #2421, toAnthropicOutputConfig's json_object
-  // branch). Manifest's error response doesn't include that raw detail though
-  // (only its own dashboard shows it) — the actual signal available here is
-  // { code: 'fallback_exhausted', source: 'manifest', provider: 'anthropic' }.
-  // Retry once without response_format so a real request still succeeds; the
-  // system prompt already requires JSON-only output and extractJson()
+  // Safety net: if Manifest still exhausts its Anthropic route because a
+  // provider rejects structured output, retry once without response_format.
+  // The system prompt already requires JSON-only output and extractJson()
   // tolerates the resulting plain-text-mode response.
   const looksLikeManifestAnthropicSchemaBug = (): boolean => {
     if (upstream.status !== 400 || !body.response_format) return false;
